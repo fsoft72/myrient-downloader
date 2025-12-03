@@ -1,0 +1,3 @@
+requests==2.32.3
+beautifulsoup4==4.13.4
+textual==6.7.1
