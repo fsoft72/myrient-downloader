@@ -12,6 +12,7 @@ from textual.containers import Container, Vertical, Horizontal
 from textual.widgets import Header, Footer, ListView, ListItem, Label, Input, Button, ProgressBar, Static, DataTable
 from textual.screen import Screen, ModalScreen
 from textual.binding import Binding
+from textual.events import Key
 from textual.worker import Worker, get_current_worker
 from textual import work
 from textual.reactive import reactive
@@ -88,11 +89,11 @@ class MyrientDownloader(App):
     """
 
     BINDINGS = [
-        Binding("d", "download_folder", "Download Folder"),
+        Binding("ctrl+d", "download_folder", "Download Folder"),
         Binding("?", "open_settings", "Settings"),
         Binding("escape", "handle_esc", "Back/Stop"),
-        Binding("delete", "go_up", "Up"),
-        Binding("q", "handle_quit", "Quit"),
+        Binding("backspace", "go_up", "Up"),
+        Binding("ctrl+q", "handle_quit", "Quit"),
     ]
 
     current_url = reactive(BASE_URL)
@@ -103,6 +104,10 @@ class MyrientDownloader(App):
     current_download_worker = None
     last_esc_time = 0
     last_q_time = 0
+    
+    search_query = ""
+    last_search_time = 0
+    SEARCH_TIMEOUT = 1.5
 
     def watch_is_loading_dir(self, value: bool) -> None:
         progress_bar = self.query_one("#progress", ProgressBar)
@@ -265,7 +270,7 @@ class MyrientDownloader(App):
                 self.current_url = href
                 self.load_directory_worker(self.current_url)
             else:
-                self.notify("Press 'd' to download the folder content.", severity="information")
+                self.notify("Press 'Ctrl+d' to download the folder content.", severity="information")
 
     def action_go_up(self):
         if self.current_url == BASE_URL:
@@ -286,6 +291,12 @@ class MyrientDownloader(App):
         self.load_directory_worker(self.current_url)
 
     def action_handle_esc(self):
+        # Clear search if active
+        if self.search_query:
+            self.search_query = ""
+            self.query_one("#status-text", Label).update("Search cleared")
+            return
+
         now = time.time()
         if now - self.last_esc_time < 0.5:
             # Double ESC
@@ -304,8 +315,48 @@ class MyrientDownloader(App):
         if now - self.last_q_time < 0.5:
             self.exit()
         else:
-            self.notify("Press 'q' again to quit", severity="information")
+            self.notify("Press 'Ctrl+q' again to quit", severity="information")
         self.last_q_time = now
+
+    def on_key(self, event: Key) -> None:
+        if self.is_loading_dir or self.is_downloading:
+            return
+
+        if not event.character or not event.character.isprintable():
+            return
+            
+        # Ignore if a modifier is pressed (except shift)
+        # Textual Key event doesn't easily expose modifiers in a way that excludes ctrl/alt combinations 
+        # that produce characters, but usually printable chars are fine.
+        # However, we want to avoid capturing keys that might be bindings if they weren't handled.
+        # But on_key runs before bindings? No, usually after if not handled?
+        # In Textual, App.on_key is a handler.
+        
+        now = time.time()
+        if now - self.last_search_time > self.SEARCH_TIMEOUT:
+            self.search_query = ""
+            
+        self.search_query += event.character
+        self.last_search_time = now
+        
+        self.query_one("#status-text", Label).update(f"Searching: {self.search_query}")
+        self.perform_search()
+
+    def perform_search(self):
+        if not self.search_query:
+            return
+            
+        query = self.search_query.lower()
+        table = self.query_one("#file-list", DataTable)
+        
+        # Iterate through row_data to find match
+        for row_key, (name, is_dir, href) in self.row_data.items():
+            if name.lower().startswith(query):
+                # Found match
+                index = table.get_row_index(row_key)
+                if index is not None:
+                    table.move_cursor(row=index)
+                return
 
     def action_open_settings(self):
         def set_dest(new_dest):
