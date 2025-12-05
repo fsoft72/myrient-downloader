@@ -36,6 +36,7 @@ from urllib3.util.retry import Retry
 
 BASE_URL = "https://myrient.erista.me/files/"
 SETTINGS_FILE = "settings.json"
+DOWNLOAD_STATUS_FILE = "download_status.json"
 VERSION = "0.4.0"
 
 
@@ -116,6 +117,7 @@ class MyrientDownloader(App):
     current_url = reactive(BASE_URL)
     destination_folder = reactive(os.getcwd())
     download_queue = []
+    scan_queue = []
     is_downloading = reactive(False)
     is_loading_dir = reactive(False)
     current_download_worker = None
@@ -160,7 +162,53 @@ class MyrientDownloader(App):
         self.load_settings()
         table = self.query_one("#file-list", DataTable)
         table.add_columns("Name", "Size")
+
+        if self.load_download_status():
+            if self.scan_queue or self.download_queue:
+                self.notify("Resuming previous download...")
+                self.set_downloading_ui(True)
+                self.start_download_worker()
+
         self.load_directory_worker(self.current_url)
+
+    def load_download_status(self):
+        if os.path.exists(DOWNLOAD_STATUS_FILE):
+            try:
+                # Check file size before loading
+                file_size = os.path.getsize(DOWNLOAD_STATUS_FILE)
+                size_mb = file_size / (1024 * 1024)
+
+                if size_mb > 10:
+                    self.notify(f"Loading large status file ({size_mb:.1f}MB), please wait...", severity="warning")
+
+                with open(DOWNLOAD_STATUS_FILE, "r") as f:
+                    data = json.load(f)
+                    self.scan_queue = data.get("scan_queue", [])
+                    self.download_queue = data.get("download_queue", [])
+                    dest = data.get("destination_folder")
+                    if dest:
+                        self.destination_folder = dest
+
+                total_items = len(self.scan_queue) + len(self.download_queue)
+                if total_items > 1000:
+                    self.notify(f"Loaded {total_items} items to process")
+
+                return True
+            except Exception as e:
+                self.show_error(f"Error loading status: {e}")
+        return False
+
+    def save_download_status(self):
+        try:
+            data = {
+                "scan_queue": self.scan_queue,
+                "download_queue": self.download_queue,
+                "destination_folder": self.destination_folder,
+            }
+            with open(DOWNLOAD_STATUS_FILE, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"Error saving status: {e}")
 
     def load_settings(self):
         try:
@@ -187,6 +235,9 @@ class MyrientDownloader(App):
 
     def on_unmount(self):
         self.save_settings()
+        # Save download status on quit if there are pending items
+        if self.scan_queue or self.download_queue:
+            self.save_download_status()
 
     def parse_directory_html(self, html_content, base_url):
         soup = BeautifulSoup(html_content, "html.parser")
@@ -430,7 +481,10 @@ class MyrientDownloader(App):
             self.notify("Nothing to download in this folder.", severity="warning")
             return
 
-        self.download_queue = items_to_process
+        self.scan_queue = items_to_process
+        self.download_queue = []
+        self.save_download_status()
+        self.is_downloading = True
         self.start_download_worker()
 
     def get_retry_session(self, retries=5, backoff_factor=0.5):
@@ -447,48 +501,98 @@ class MyrientDownloader(App):
         session.mount("https://", adapter)
         return session
 
+    def update_status_ui(self, message):
+        self.query_one("#status-text", Label).update(message)
+
+    def update_progress_ui(self, total=None, progress=None):
+        bar = self.query_one("#progress", ProgressBar)
+        if total is not None:
+            bar.total = total
+        if progress is not None:
+            bar.progress = progress
+
+    def set_downloading_ui(self, active):
+        self.is_downloading = active
+        sb = self.query_one("#status-bar")
+        bar = self.query_one("#progress", ProgressBar)
+        if active:
+            sb.add_class("downloading")
+            bar.display = True
+        else:
+            sb.remove_class("downloading")
+            bar.display = False
+            self.query_one("#status-text", Label).update("Ready")
+
     @work(thread=True, exclusive=True)
     def start_download_worker(self):
-        self.is_downloading = True
-        self.query_one("#status-bar").add_class("downloading")
-        progress_bar = self.query_one("#progress", ProgressBar)
-        progress_bar.display = True
-        status_label = self.query_one("#status-text", Label)
+        self.app.call_from_thread(self.set_downloading_ui, True)
 
         try:
-            queue = list(self.download_queue)
             worker = get_current_worker()
             session = self.get_retry_session()
 
-            while queue:
+            # Process scan queue in batches to avoid tight loops
+            items_processed = 0
+            last_status_save = time.time()
+
+            while self.scan_queue or self.download_queue:
                 if worker.is_cancelled:
                     return
 
-                name, is_dir, url = queue.pop(0)
+                if self.scan_queue:
+                    name, is_dir, url = self.scan_queue.pop(0)
 
-                if is_dir:
-                    scan_path = (
-                        unquote(url[len(BASE_URL) :])
-                        if url.startswith(BASE_URL)
-                        else url
-                    )
-                    status_label.update(Text(f"Scanning: {scan_path}"))
-                    try:
-                        response = session.get(url, timeout=30)
-                        response.raise_for_status()
-                        items = self.parse_directory_html(response.text, url)
-                        # Add to queue
-                        for item_name, item_is_dir, item_url, _ in items:
-                            queue.append((item_name, item_is_dir, item_url))
-                    except Exception as e:
-                        self.show_error(f"Error scanning {name}: {e}")
+                    if is_dir:
+                        scan_path = (
+                            unquote(url[len(BASE_URL) :])
+                            if url.startswith(BASE_URL)
+                            else url
+                        )
+                        self.app.call_from_thread(
+                            self.update_status_ui, Text(f"Scanning: {scan_path}")
+                        )
+                        try:
+                            response = session.get(url, timeout=30)
+                            response.raise_for_status()
+                            items = self.parse_directory_html(response.text, url)
+                            # Add to queue
+                            for item_name, item_is_dir, item_url, _ in items:
+                                self.scan_queue.append(
+                                    (item_name, item_is_dir, item_url)
+                                )
+                        except Exception as e:
+                            self.app.call_from_thread(
+                                self.show_error, f"Error scanning {name}: {e}"
+                            )
+                    else:
+                        self.download_queue.append((name, is_dir, url))
+
+                    items_processed += 1
+
+                    # Update status every 100 items or every 5 seconds
+                    now = time.time()
+                    if items_processed % 100 == 0 or (now - last_status_save) >= 5:
+                        self.app.call_from_thread(
+                            self.update_status_ui,
+                            Text(f"Processing: {len(self.scan_queue)} scanning, {len(self.download_queue)} ready to download")
+                        )
+                        last_status_save = now
+
+                        # Small sleep to prevent CPU spinning on large batches
+                        if items_processed % 1000 == 0:
+                            time.sleep(0.1)
+
                     continue
 
-                # It is a file
-                status_label.update(Text(f"Downloading: {name} (Queue: {len(queue)})"))
+                name, is_dir, url = self.download_queue[0]
+                self.app.call_from_thread(
+                    self.update_status_ui,
+                    Text(f"Downloading: {name} (Queue: {len(self.download_queue)})"),
+                )
 
-                # Calculate path based on URL
                 if not url.startswith(BASE_URL):
+                    self.download_queue.pop(0)
+                    self.save_download_status()
                     continue
 
                 rel_path = url[len(BASE_URL) :]
@@ -500,6 +604,7 @@ class MyrientDownloader(App):
 
                 # Retry loop for file download
                 max_retries = 3
+                success = False
                 for attempt in range(max_retries):
                     try:
                         # Resume logic
@@ -519,6 +624,7 @@ class MyrientDownloader(App):
 
                                 if downloaded >= total_size and total_size > 0:
                                     # Already done
+                                    success = True
                                     break
 
                                 if downloaded > 0:
@@ -542,8 +648,11 @@ class MyrientDownloader(App):
                             if mode == "ab":
                                 total_length += downloaded
 
-                            progress_bar.update(total=total_length, progress=downloaded)
+                            self.app.call_from_thread(
+                                self.update_progress_ui, total=total_length, progress=downloaded
+                            )
 
+                            last_update = 0
                             with open(filepath, mode) as f:
                                 for chunk in r.iter_content(chunk_size=8192):
                                     if worker.is_cancelled:
@@ -551,29 +660,41 @@ class MyrientDownloader(App):
                                     if chunk:
                                         f.write(chunk)
                                         downloaded += len(chunk)
-                                        progress_bar.update(progress=downloaded)
+                                        now = time.time()
+                                        if now - last_update > 0.1:
+                                            self.app.call_from_thread(
+                                                self.update_progress_ui, progress=downloaded
+                                            )
+                                            last_update = now
+                            
+                            self.app.call_from_thread(
+                                self.update_progress_ui, progress=downloaded
+                            )
 
                         # Success
+                        success = True
                         break
                     except Exception as e:
                         if attempt == max_retries - 1:
-                            self.show_error(f"Failed to download {name}: {e}")
+                            self.app.call_from_thread(
+                                self.show_error, f"Failed to download {name}: {e}"
+                            )
                         else:
                             time.sleep(1)
                             continue
 
-            self.is_downloading = False
-            self.query_one("#status-bar").remove_class("downloading")
-            progress_bar.display = False
-            status_label.update("Ready")
-            self.notify("Download finished!")
+                self.download_queue.pop(0)
+
+            if os.path.exists(DOWNLOAD_STATUS_FILE):
+                os.remove(DOWNLOAD_STATUS_FILE)
+
+            self.app.call_from_thread(self.set_downloading_ui, False)
+            self.app.call_from_thread(self.notify, "Download finished!")
 
         except Exception as e:
-            self.show_error(f"Download worker crashed: {e}")
-            self.is_downloading = False
-            self.query_one("#status-bar").remove_class("downloading")
-            progress_bar.display = False
-            status_label.update("Error")
+            self.app.call_from_thread(self.show_error, f"Download worker crashed: {e}")
+            self.app.call_from_thread(self.set_downloading_ui, False)
+            self.app.call_from_thread(self.update_status_ui, "Error")
 
     def stop_download(self):
         # Cancel the worker

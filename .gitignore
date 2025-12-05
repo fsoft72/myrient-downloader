@@ -4,3 +4,4 @@ dist
 build
 *.egg-info
 settings.json
+download_status.json
